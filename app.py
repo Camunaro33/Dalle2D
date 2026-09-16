@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-Streamlit app: point/corner-supported rectangular slab, free edges,
-uniform + point load(s) - Kirchhoff thin-plate FE (ACM 12-DOF element).
+Streamlit applet version of SLAB2D_single_v1.py
+Corner/point-supported rectangular slab, Kirchhoff thin-plate FE (ACM 12-DOF).
 
 Run locally:   streamlit run app.py
-Deploy: push this file + requirements.txt to a GitHub repo, then
-        connect the repo at https://share.streamlit.io
+Deploy:        push this file + requirements.txt to the GitHub repo,
+                Streamlit Cloud auto-redeploys on every push.
 """
+
 import numpy as np
 import sympy as sp
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import streamlit as st
 
-st.set_page_config(page_title="Slab FE — point supports, free edges", layout="wide")
-
+st.set_page_config(page_title="Dalle 2D - GCI2011", layout="wide")
 
 # ============================================================================
-# CORE FE CODE (mesh, ACM element, solver, moment recovery)
+# CORE ENGINE (unchanged math from SLAB2D_single_v1.py) ---------------------
 # ============================================================================
 
 class PlateMesh:
@@ -51,10 +52,8 @@ class PlateMesh:
         return ids, snapped
 
 
-@st.cache_resource(show_spinner="Deriving ACM plate element (symbolic, once per server)...")
+@st.cache_resource(show_spinner="Dérivation symbolique de l'élément ACM (une seule fois)...")
 def build_acm_element():
-    """ACM 12-DOF non-conforming thin plate element (no shear DOFs ->
-    immune to shear locking / shear hourglassing). Returns Ke(a,b,D,nu), Fe(a,b,q)."""
     x, y, a, b, nu_s, D_s, q_s = sp.symbols('x y a b nu D q')
     monoms = [1, x, y, x**2, x*y, y**2, x**3, x**2*y, x*y**2, y**3, x**3*y, x*y**3]
     P = sp.Matrix([monoms])
@@ -72,8 +71,11 @@ def build_acm_element():
     Cinv = C.inv()
 
     N = P * Cinv
-    Bx, By, Bxy = dP(2, 0) * Cinv, dP(0, 2) * Cinv, 2 * dP(1, 1) * Cinv
+    Bx = dP(2, 0) * Cinv
+    By = dP(0, 2) * Cinv
+    Bxy = 2 * dP(1, 1) * Cinv
     Bmat = sp.Matrix.vstack(Bx, By, Bxy)
+
     Db = D_s * sp.Matrix([[1, nu_s, 0], [nu_s, 1, 0], [0, 0, (1 - nu_s) / 2]])
 
     Ke_sym = (Bmat.T * Db * Bmat).applyfunc(
@@ -86,7 +88,7 @@ def build_acm_element():
     return Ke_func, Fe_func
 
 
-@st.cache_resource(show_spinner="Deriving moment-recovery operators (symbolic, once per server)...")
+@st.cache_resource(show_spinner="Dérivation des opérateurs de moments (une seule fois)...")
 def build_moment_recovery_ops():
     x, y, a, b = sp.symbols('x y a b')
     monoms = [1, x, y, x**2, x*y, y**2, x**3, x**2*y, x*y**2, y**3, x**3*y, x*y**3]
@@ -112,38 +114,16 @@ def build_moment_recovery_ops():
     return {k: sp.lambdify((x, y, a, b), v, 'numpy') for k, v in ops.items()}
 
 
-def solve_plate_acm(mesh, Ke_func, Fe_func, D, nu, q, supported_nodes, point_loads=None):
-    """DOF per node: (w, dw/dx, dw/dy). supported_nodes: w=0 prescribed there."""
-    ex, ey = mesh.Lx / mesh.nx, mesh.Ly / mesh.ny
-    Ke = np.array(Ke_func(ex, ey, D, nu), dtype=float)
-    Fe = np.array(Fe_func(ex, ey, q), dtype=float).flatten()
-
-    ndof = 3 * mesh.n_nodes
-    K = sparse.lil_matrix((ndof, ndof))
-    F = np.zeros(ndof)
-    for el in mesh.elems:
-        edofs = np.array([[3 * n, 3 * n + 1, 3 * n + 2] for n in el]).ravel()
-        K[np.ix_(edofs, edofs)] += Ke
-        F[edofs] += Fe
-
-    if point_loads:
-        for (xp, yp, P) in point_loads:
-            node = mesh.nearest_node(xp, yp)
-            F[3 * node] += P
-
-    K = K.tocsr()
-    fixed = np.array([3 * n for n in supported_nodes], dtype=int)
-    free = np.setdiff1d(np.arange(ndof), fixed)
-    Uf = spsolve(K[np.ix_(free, free)].tocsc(), F[free])
-    U = np.zeros(ndof)
-    U[free] = Uf
-    return U[0::3], U
+_Ke_func, _Fe_func = build_acm_element()
+_mom_ops = build_moment_recovery_ops()
 
 
-def recover_moments(mesh, U, D, nu, mom_ops):
-    ex, ey = mesh.Lx / mesh.nx, mesh.Ly / mesh.ny
+def recover_moments(mesh, U, D, nu):
+    ex = mesh.Lx / mesh.nx
+    ey = mesh.Ly / mesh.ny
     n_nodes = mesh.n_nodes
     corner_local = [(0, 0), (ex, 0), (ex, ey), (0, ey)]
+
     sums = {k: np.zeros(n_nodes) for k in ['mxx', 'myy', 'mxy', 'tx', 'ty']}
     counts = np.zeros(n_nodes)
 
@@ -152,13 +132,13 @@ def recover_moments(mesh, U, D, nu, mom_ops):
         d_e = U[edofs]
         for local_i, node in enumerate(el):
             xl, yl = corner_local[local_i]
-            Wxx = float(np.array(mom_ops['xx'](xl, yl, ex, ey)).flatten() @ d_e)
-            Wyy = float(np.array(mom_ops['yy'](xl, yl, ex, ey)).flatten() @ d_e)
-            Wxy = float(np.array(mom_ops['xy'](xl, yl, ex, ey)).flatten() @ d_e)
-            Wxxx = float(np.array(mom_ops['xxx'](xl, yl, ex, ey)).flatten() @ d_e)
-            Wxyy = float(np.array(mom_ops['xyy'](xl, yl, ex, ey)).flatten() @ d_e)
-            Wyyy = float(np.array(mom_ops['yyy'](xl, yl, ex, ey)).flatten() @ d_e)
-            Wxxy = float(np.array(mom_ops['xxy'](xl, yl, ex, ey)).flatten() @ d_e)
+            Wxx = float(np.array(_mom_ops['xx'](xl, yl, ex, ey)).flatten() @ d_e)
+            Wyy = float(np.array(_mom_ops['yy'](xl, yl, ex, ey)).flatten() @ d_e)
+            Wxy = float(np.array(_mom_ops['xy'](xl, yl, ex, ey)).flatten() @ d_e)
+            Wxxx = float(np.array(_mom_ops['xxx'](xl, yl, ex, ey)).flatten() @ d_e)
+            Wxyy = float(np.array(_mom_ops['xyy'](xl, yl, ex, ey)).flatten() @ d_e)
+            Wyyy = float(np.array(_mom_ops['yyy'](xl, yl, ex, ey)).flatten() @ d_e)
+            Wxxy = float(np.array(_mom_ops['xxy'](xl, yl, ex, ey)).flatten() @ d_e)
 
             sums['mxx'][node] += -D * (Wxx + nu * Wyy)
             sums['myy'][node] += -D * (Wyy + nu * Wxx)
@@ -175,209 +155,433 @@ def recover_moments(mesh, U, D, nu, mom_ops):
 def principal_moments(mxx, myy, mxy):
     avg = (mxx + myy) / 2.0
     R = np.sqrt(((mxx - myy) / 2.0) ** 2 + mxy ** 2)
-    return avg + R, avg - R, 0.5 * np.arctan2(2 * mxy, (mxx - myy))
+    M1 = avg + R
+    M2 = avg - R
+    alpha = 0.5 * np.arctan2(2 * mxy, (mxx - myy))
+    return M1, M2, alpha
+
+
+def solve_plate_acm(mesh, D, nu, q, supported_nodes, point_loads=None):
+    ex = mesh.Lx / mesh.nx
+    ey = mesh.Ly / mesh.ny
+    Ke = np.array(_Ke_func(ex, ey, D, nu), dtype=float)
+    Fe = np.array(_Fe_func(ex, ey, q), dtype=float).flatten()
+
+    ndof = 3 * mesh.n_nodes
+    K = sparse.lil_matrix((ndof, ndof))
+    F = np.zeros(ndof)
+
+    for el in mesh.elems:
+        edofs = np.array([[3 * n, 3 * n + 1, 3 * n + 2] for n in el]).ravel()
+        K[np.ix_(edofs, edofs)] += Ke
+        F[edofs] += Fe
+
+    if point_loads:
+        for (xp, yp, P) in point_loads:
+            node = mesh.nearest_node(xp, yp)
+            F[3 * node] += P
+
+    K = K.tocsr()
+    fixed = np.array([3 * n for n in supported_nodes], dtype=int)
+    free = np.setdiff1d(np.arange(ndof), fixed)
+
+    Uf = spsolve(K[np.ix_(free, free)].tocsc(), F[free])
+    U = np.zeros(ndof)
+    U[free] = Uf
+    return U[0::3], U
+
+
+def As_required(M_field, fy, phi, As_min, d_eff):
+    As = np.abs(M_field) / (phi * fy * 0.9 * d_eff)
+    As = np.maximum(As, As_min)
+    return As * 1e6  # mm^2/m
 
 
 # ============================================================================
-# SIDEBAR — INPUT
+# SIDEBAR INPUTS --------------------------------------------------------------
 # ============================================================================
 
-st.sidebar.header("Geometry & material")
-L = st.sidebar.number_input("Slab side length L [m]", 0.5, 50.0, 4.0, 0.1)
-t = st.sidebar.number_input("Thickness t [m]", 0.02, 2.0, 0.20, 0.01)
-E_GPa = st.sidebar.number_input("Young's modulus E [GPa]", 1.0, 500.0, 25.0, 1.0)
-nu = st.sidebar.slider("Poisson's ratio ν", 0.0, 0.49, 0.20, 0.01)
-n_mesh = st.sidebar.slider("Mesh density (elements/side)", 8, 64, 32, 4)
+st.sidebar.header("Géométrie & matériau")
+L = st.sidebar.number_input("Portée L [m]", value=4.0, min_value=1.0, step=0.5)
+t = st.sidebar.number_input("Épaisseur t [m]", value=0.20, min_value=0.05, step=0.01, format="%.3f")
+E_GPa = st.sidebar.number_input("Module E [GPa]", value=25.0, min_value=1.0, step=1.0)
+nu = st.sidebar.number_input("Coeff. Poisson ν", value=0.20, min_value=0.0, max_value=0.49, step=0.01)
 E = E_GPa * 1e9
 
-st.sidebar.header("Supports (w = 0, snapped to mesh)")
-n_supports = st.sidebar.number_input("Number of supports", 3, 8, 4, 1)
-default_corners = [(0.0, 0.0), (L, 0.0), (L, L), (0.0, L)]
-support_points = []
-for i in range(int(n_supports)):
-    dx, dy = default_corners[i] if i < 4 else (L / 2, L / 2)
-    c1, c2 = st.sidebar.columns(2)
-    x_i = c1.number_input(f"support {i+1} x", 0.0, L, float(dx), 0.1, key=f"sx{i}")
-    y_i = c2.number_input(f"support {i+1} y", 0.0, L, float(dy), 0.1, key=f"sy{i}")
-    support_points.append((x_i, y_i))
-
-st.sidebar.header("Loads")
-q_kPa = st.sidebar.number_input("Uniform load q [kPa]", 0.0, 200.0, 10.0, 0.5)
+st.sidebar.header("Charges")
+q_kPa = st.sidebar.slider("Charge uniforme q [kPa]", min_value=0.0, max_value=50.0,
+                           value=10.0, step=0.5)
 q = q_kPa * 1e3
 
-n_point_loads = st.sidebar.number_input("Number of point loads", 0, 6, 1, 1)
-point_loads_input = []
-for i in range(int(n_point_loads)):
-    c1, c2, c3 = st.sidebar.columns(3)
-    xp = c1.number_input(f"P{i+1} x", 0.0, L, float(L / 2), 0.1, key=f"px{i}")
-    yp = c2.number_input(f"P{i+1} y", 0.0, L, float(L / 2), 0.1, key=f"py{i}")
-    Pp = c3.number_input(f"P{i+1} [kN]", 0.0, 5000.0, 50.0, 5.0, key=f"pp{i}") * 1e3
-    point_loads_input.append((xp, yp, Pp))
+use_point_load = st.sidebar.checkbox("Ajouter une charge ponctuelle", value=True)
+if use_point_load:
+    px = st.sidebar.slider("Position x charge ponctuelle [m]", min_value=0.0, max_value=float(L),
+                            value=min(L / 4, L), step=0.05)
+    py = st.sidebar.slider("Position y charge ponctuelle [m]", min_value=0.0, max_value=float(L),
+                            value=min(L / 2, L), step=0.05)
+    P_kN = st.sidebar.slider("Valeur P [kN]", min_value=0.0, max_value=1000.0,
+                              value=550.0, step=10.0)
+    pl_text = f"{px:.3f}, {py:.3f}, {P_kN:.3f}"
+else:
+    pl_text = ""
 
-st.sidebar.header("Serviceability")
-defl_limit_denom = st.sidebar.number_input("f/span limit denominator (L/N)", 100, 1000, 360, 10)
+st.sidebar.header("Maillage")
+n_mesh = st.sidebar.slider("Éléments par côté", min_value=8, max_value=60, value=32, step=2)
+
+st.sidebar.header("Appuis")
+sp_text = st.sidebar.text_area(
+    "Points d'appui (x, y) — un par ligne",
+    value=f"0.0, 0.0\n{L}, 0.0\n{L}, {L}\n0.0, {L}")
+
+with st.sidebar.expander("Balayage charge / service"):
+    q_sweep_text = st.text_input("Balayage q [kPa], séparé par des virgules",
+                                  value="5, 10, 15, 20, 25, 30")
+    DEFLECTION_LIMIT_DENOM = st.number_input("Limite flèche L/N", value=360, step=10)
+
+with st.sidebar.expander("Paramètres d'armature"):
+    cover = st.number_input("Enrobage [mm]", value=30.0, step=5.0) / 1000.0
+    bar_diameter = st.number_input("Diamètre barre estimé [mm]", value=15.0, step=1.0) / 1000.0
+    fy_CSA = st.number_input("fy CSA [MPa]", value=400.0, step=25.0) * 1e6
+    phi_s_CSA = st.number_input("φs CSA A23.3", value=0.85, step=0.01)
+    fy_ACI = st.number_input("fy ACI [MPa]", value=420.0, step=25.0) * 1e6
+    phi_ACI = st.number_input("φ ACI 318", value=0.90, step=0.01)
+
+
+def parse_triples(text):
+    out = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 3:
+            out.append((float(parts[0]), float(parts[1]), float(parts[2]) * 1e3))
+    return out
+
+
+def parse_pairs(text):
+    out = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2:
+            out.append((float(parts[0]), float(parts[1])))
+    return out
+
+
+try:
+    POINT_LOADS = parse_triples(pl_text)
+    SUPPORT_POINTS = parse_pairs(sp_text)
+    q_sweep = [float(v.strip()) * 1e3 for v in q_sweep_text.split(",") if v.strip()]
+except ValueError:
+    st.error("Format invalide dans les charges ponctuelles, appuis ou balayage — vérifier les virgules.")
+    st.stop()
+
+if len(SUPPORT_POINTS) < 3:
+    st.error("Au moins 3 points d'appui non alignés sont requis.")
+    st.stop()
 
 # ============================================================================
-# SOLVE
+# SOLVE ------------------------------------------------------------------
 # ============================================================================
 
 B = E * t**3 / (12.0 * (1 - nu**2))
-Ke_func, Fe_func = build_acm_element()
-mom_ops = build_moment_recovery_ops()
 
-mesh = PlateMesh(L, L, int(n_mesh), int(n_mesh))
-supported, supported_xy = mesh.nearest_nodes(support_points)
+mesh = PlateMesh(L, L, n_mesh, n_mesh)
+supported, supported_xy = mesh.nearest_nodes(SUPPORT_POINTS)
 
 pt_loads_used = []
-for (xp, yp, P) in point_loads_input:
-    if P > 0:
-        node = mesh.nearest_node(xp, yp)
-        pt_loads_used.append((*mesh.nodes[node], P))
+for (xl, yl, P) in POINT_LOADS:
+    node = mesh.nearest_node(xl, yl)
+    xu, yu = mesh.nodes[node]
+    pt_loads_used.append((xu, yu, P))
 
-w, U = solve_plate_acm(mesh, Ke_func, Fe_func, B, nu, q, supported,
-                        point_loads=pt_loads_used if pt_loads_used else None)
+w, U = solve_plate_acm(mesh, B, nu, q, supported, point_loads=pt_loads_used if pt_loads_used else None)
 
-center_node = mesh.node_id[int(n_mesh) // 2, int(n_mesh) // 2]
+center_node = mesh.node_id[n_mesh // 2, n_mesh // 2]
 Wc = w[center_node]
 Wmax_node = np.argmax(np.abs(w))
 Wmax = w[Wmax_node]
 
-mxx, myy, mxy, tx, ty = recover_moments(mesh, U, B, nu, mom_ops)
-M1, M2, alpha = principal_moments(mxx, myy, mxy)
+X = mesh.nodes[:, 0].reshape(n_mesh + 1, n_mesh + 1)
+Y = mesh.nodes[:, 1].reshape(n_mesh + 1, n_mesh + 1)
+W = w.reshape(n_mesh + 1, n_mesh + 1) * 1000
 
-X = mesh.nodes[:, 0].reshape(int(n_mesh) + 1, int(n_mesh) + 1)
-Y = mesh.nodes[:, 1].reshape(int(n_mesh) + 1, int(n_mesh) + 1)
 sx = [p[0] for p in supported_xy]
 sy = [p[1] for p in supported_xy]
 
-# ============================================================================
-# MAIN PAGE
-# ============================================================================
+mxx, myy, mxy, tx, ty = recover_moments(mesh, U, B, nu)
+M1, M2, alpha = principal_moments(mxx, myy, mxy)
 
-st.title("Point/corner-supported slab — Kirchhoff plate FE")
-st.caption("ACM 12-DOF non-conforming thin-plate element, validated against the classical "
-           "simply-supported-square Navier benchmark (α = 0.00406, β = 0.0479 for ν = 0.3).")
+mxx_g = mxx.reshape(n_mesh + 1, n_mesh + 1)
+myy_g = myy.reshape(n_mesh + 1, n_mesh + 1)
+mxy_g = mxy.reshape(n_mesh + 1, n_mesh + 1)
+tx_g = tx.reshape(n_mesh + 1, n_mesh + 1)
+ty_g = ty.reshape(n_mesh + 1, n_mesh + 1)
+M1_g = M1.reshape(n_mesh + 1, n_mesh + 1)
+M2_g = M2.reshape(n_mesh + 1, n_mesh + 1)
+alpha_g = alpha.reshape(n_mesh + 1, n_mesh + 1)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Flexural rigidity B", f"{B:.3e} N·m")
-c2.metric("Center deflection", f"{Wc*1000:.3f} mm")
-c3.metric("Max deflection", f"{Wmax*1000:.3f} mm")
-N_worst = L / max(abs(Wmax), 1e-9)
-status = "OK" if N_worst >= defl_limit_denom else "EXCEEDS LIMIT"
-c4.metric(f"Worst f/span (limit L/{defl_limit_denom})", f"L/{N_worst:.0f}", status)
+d_eff = t - cover - bar_diameter / 2.0
+As_min_CSA = 0.002 * 1.0 * t
+As_min_ACI = 0.0018 * 1.0 * t
 
-tabs = st.tabs(["Deflection map", "Deflection vs. load", "f/span map",
-                 "Moments mxx/myy/mxy", "Shears tx/ty",
-                 "Principal moments M1/M2", "Principal directions"])
+As_CSA_xx = As_required(mxx, fy_CSA, phi_s_CSA, As_min_CSA, d_eff)
+As_CSA_yy = As_required(myy, fy_CSA, phi_s_CSA, As_min_CSA, d_eff)
+As_ACI_xx = As_required(mxx, fy_ACI, phi_ACI, As_min_ACI, d_eff)
+As_ACI_yy = As_required(myy, fy_ACI, phi_ACI, As_min_ACI, d_eff)
 
-with tabs[0]:
-    W_mm = w.reshape(int(n_mesh) + 1, int(n_mesh) + 1) * 1000
-    fig, ax = plt.subplots(figsize=(6.5, 5.5))
-    cf = ax.contourf(X, Y, W_mm, levels=20, cmap='viridis')
-    ax.contour(X, Y, W_mm, levels=10, colors='white', linewidths=0.5, alpha=0.6)
-    ax.plot(sx, sy, 'ko', ms=7, label='supports')
+As_CSA_xx_g = As_CSA_xx.reshape(n_mesh + 1, n_mesh + 1)
+As_CSA_yy_g = As_CSA_yy.reshape(n_mesh + 1, n_mesh + 1)
+As_ACI_xx_g = As_ACI_xx.reshape(n_mesh + 1, n_mesh + 1)
+As_ACI_yy_g = As_ACI_yy.reshape(n_mesh + 1, n_mesh + 1)
+
+d_mm = d_eff * 1000.0
+b_mm = 1000.0
+
+skip = max(1, n_mesh // 10)
+Xq = X[::skip, ::skip]
+Yq = Y[::skip, ::skip]
+Aq = alpha_g[::skip, ::skip]
+M1q = M1_g[::skip, ::skip]
+M2q = M2_g[::skip, ::skip]
+mxx_q = mxx_g[::skip, ::skip]
+myy_q = myy_g[::skip, ::skip]
+mxy_q = mxy_g[::skip, ::skip]
+
+spacing = skip * (L / n_mesh)
+bar_half_len = 0.40 * spacing
+
+# rho1/rho2 computed on the SAME (subsampled) grid as M1q/M2q, so shapes
+# match when draw_principal_bars masks rhofull by Mq (matches original script).
+As1_bar = As_required(M1q, fy_CSA, phi_s_CSA, As_min_CSA, d_eff)
+As2_bar = As_required(M2q, fy_CSA, phi_s_CSA, As_min_CSA, d_eff)
+rho1 = As1_bar / (b_mm * d_mm)
+rho2 = As2_bar / (b_mm * d_mm)
+
+lw_min, lw_max = 1.0, 7.0
+
+
+def rho_to_lw(rho):
+    lo, hi = rho.min(), rho.max()
+    if hi - lo < 1e-12:
+        return np.full_like(rho, lw_max)
+    return lw_min + (rho - lo) / (hi - lo) * (lw_max - lw_min)
+
+
+lw1 = rho_to_lw(rho1)
+lw2 = rho_to_lw(rho2)
+
+mx_bot_g = np.maximum(mxx_g + np.abs(mxy_g), 0.0)
+my_bot_g = np.maximum(myy_g + np.abs(mxy_g), 0.0)
+mx_top_g = np.maximum(-(mxx_g - np.abs(mxy_g)), 0.0)
+my_top_g = np.maximum(-(myy_g - np.abs(mxy_g)), 0.0)
+
+mx_bot_q = mx_bot_g[::skip, ::skip]
+my_bot_q = my_bot_g[::skip, ::skip]
+mx_top_q = mx_top_g[::skip, ::skip]
+my_top_q = my_top_g[::skip, ::skip]
+
+RHO_CMAP = plt.cm.YlOrRd
+
+
+def bar_linewidths(mag_q):
+    As_q = As_required(mag_q, fy_CSA, phi_s_CSA, As_min_CSA, d_eff)
+    rho_q = As_q / (b_mm * d_mm)
+    return rho_to_lw(rho_q), rho_q
+
+
+def draw_orthogonal_bars(ax, mx_q, my_q, linestyle):
+    lw_x, rho_x = bar_linewidths(mx_q)
+    lw_y, rho_y = bar_linewidths(my_q)
+    vmin = min(rho_x.min(), rho_y.min())
+    vmax = max(rho_x.max(), rho_y.max())
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+    for i in range(Xq.shape[0]):
+        for j in range(Xq.shape[1]):
+            x0, y0 = Xq[i, j], Yq[i, j]
+            if mx_q[i, j] > 0:
+                ax.plot([x0 - bar_half_len, x0 + bar_half_len], [y0, y0],
+                        color=RHO_CMAP(norm(rho_x[i, j])), linestyle=linestyle,
+                        linewidth=lw_x[i, j], solid_capstyle='round')
+            if my_q[i, j] > 0:
+                ax.plot([x0, x0], [y0 - bar_half_len, y0 + bar_half_len],
+                        color=RHO_CMAP(norm(rho_y[i, j])), linestyle=linestyle,
+                        linewidth=lw_y[i, j], solid_capstyle='round')
+    return rho_x, rho_y, norm
+
+
+def draw_principal_bars(ax, sign_wanted, linestyle):
+    drawn_rho = []
+    for Mq, rhofull in [(M1q, rho1), (M2q, rho2)]:
+        mask = (Mq >= 0) if sign_wanted > 0 else (Mq < 0)
+        drawn_rho.append(rhofull[mask])
+    drawn_rho = np.concatenate(drawn_rho) if drawn_rho and any(a.size for a in drawn_rho) else np.array([0.0])
+    vmin, vmax = drawn_rho.min(), drawn_rho.max()
+    norm = plt.Normalize(vmin=vmin, vmax=max(vmax, vmin + 1e-9))
+
+    for Mq, lwfull, rhofull in [(M1q, lw1, rho1), (M2q, lw2, rho2)]:
+        base_angle = Aq if Mq is M1q else (Aq + np.pi / 2)
+        for i in range(Xq.shape[0]):
+            for j in range(Xq.shape[1]):
+                Mval = Mq[i, j]
+                if (sign_wanted > 0 and Mval < 0) or (sign_wanted < 0 and Mval >= 0):
+                    continue
+                x0, y0 = Xq[i, j], Yq[i, j]
+                ang = base_angle[i, j]
+                dx, dy = np.cos(ang) * bar_half_len, np.sin(ang) * bar_half_len
+                ax.plot([x0 - dx, x0 + dx], [y0 - dy, y0 + dy],
+                        color=RHO_CMAP(norm(rhofull[i, j])), linestyle=linestyle,
+                        linewidth=lwfull[i, j], solid_capstyle='round')
+    return norm
+
+
+def base_ax(ax, title):
+    ax.set_facecolor('#f7f2ea')
+    ax.plot(sx, sy, 'ko', ms=8, zorder=5)
     if pt_loads_used:
         ax.plot([p[0] for p in pt_loads_used], [p[1] for p in pt_loads_used],
-                 'r^', ms=10, label='point load')
-        ax.legend(loc='upper right', fontsize=8)
+                'g^', ms=11, zorder=5)
     ax.set_aspect('equal'); ax.set_xlabel('x [m]'); ax.set_ylabel('y [m]')
-    ax.set_title('Deflection map W(x,y) [mm]')
-    fig.colorbar(cf, label='W [mm]')
-    st.pyplot(fig)
+    ax.set_title(title, fontsize=10)
 
-with tabs[1]:
-    q_sweep_kPa = np.linspace(0, max(q_kPa, 10) * 1.5, 8)
-    Wc_list = []
-    for qi_kPa in q_sweep_kPa:
-        wi, _ = solve_plate_acm(mesh, Ke_func, Fe_func, B, nu, qi_kPa * 1e3, supported,
-                                 point_loads=pt_loads_used if pt_loads_used else None)
-        Wc_list.append(wi[center_node] * 1000)
-    fig, ax = plt.subplots(figsize=(6, 4.5))
-    ax.plot(q_sweep_kPa, Wc_list, 'o-', color='#1f6f5c')
-    ax.axvline(q_kPa, color='crimson', linestyle='--', linewidth=1, label='current q')
-    ax.set_xlabel('Uniform load q [kPa]  (point loads held fixed)')
-    ax.set_ylabel('Center deflection Wc [mm]')
-    ax.set_title('Center deflection vs. uniform load')
-    ax.legend(); ax.grid(True, alpha=0.3)
-    st.pyplot(fig)
 
-with tabs[2]:
-    eps = 1e-9
-    N_ratio = L / np.maximum(np.abs(w.reshape(int(n_mesh) + 1, int(n_mesh) + 1)), eps)
-    N_plot = np.clip(N_ratio, 0, 6 * defl_limit_denom)
-    fig, ax = plt.subplots(figsize=(6.5, 5.5))
-    cf = ax.contourf(X, Y, N_plot, levels=25, cmap='RdYlGn')
-    cs = ax.contour(X, Y, N_ratio, levels=[defl_limit_denom], colors='black', linewidths=2)
-    ax.clabel(cs, inline=True, fontsize=8, fmt=f'L/{defl_limit_denom} limit')
-    ax.plot(sx, sy, 'ko', ms=7)
+def add_rho_colorbar(fig, ax, norm, face_label, linestyle):
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=RHO_CMAP)
+    sm.set_array([])
+    cb = fig.colorbar(sm, ax=ax, shrink=0.85)
+    cb.set_label('rho = As/(b.d)  [%]')
+    ticks = cb.get_ticks()
+    cb.set_ticks(ticks)
+    cb.set_ticklabels([f'{v*100:.2f}' for v in ticks])
+    ax.legend(handles=[Line2D([0], [0], color='dimgray', lw=3, linestyle=linestyle,
+                               label=face_label)],
+              loc='upper right', fontsize=8, framealpha=0.9)
+
+
+# ============================================================================
+# UI: HEADER + KPIs -----------------------------------------------------------
+# ============================================================================
+
+st.title("Dalle 2D — Analyse et design (GCI2011)")
+
+parts = []
+if q != 0:
+    parts.append(f"q={q/1e3:.1f} kPa")
+if pt_loads_used:
+    parts.append(", ".join(f"P={P/1e3:.0f}kN@({xu:.1f},{yu:.1f})" for (xu, yu, P) in pt_loads_used))
+load_label = " + ".join(parts) if parts else "aucune charge"
+
+N_worst = L / max(abs(Wmax), 1e-9)
+status = "OK" if N_worst >= DEFLECTION_LIMIT_DENOM else "DÉPASSE LA LIMITE"
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Flèche au centre", f"{Wc*1000:.2f} mm")
+c2.metric("Flèche max", f"{Wmax*1000:.2f} mm")
+c3.metric("f/portée pire cas", f"L/{N_worst:.0f}", status)
+c4.metric("Rigidité flexionnelle B", f"{B:.3e} N·m")
+st.caption(f"Cas de charge : {load_label}")
+
+tabs = st.tabs(["Flèche", "Moments & efforts", "Moments principaux",
+                 "Armature — As", "Armature — plans"])
+
+# ---- TAB 1: deflection -----------------------------------------------------
+with tabs[0]:
+    fig1, ax1 = plt.subplots(figsize=(6.5, 5.5))
+    cf = ax1.contourf(X, Y, W, levels=20, cmap='viridis')
+    cs = ax1.contour(X, Y, W, levels=10, colors='white', linewidths=0.5, alpha=0.6)
+    ax1.clabel(cs, inline=True, fontsize=7, fmt='%.1f')
+    ax1.plot(sx, sy, 'ko', ms=7, label='appuis')
     if pt_loads_used:
-        ax.plot([p[0] for p in pt_loads_used], [p[1] for p in pt_loads_used], 'r^', ms=10)
-    ax.set_aspect('equal'); ax.set_xlabel('x [m]'); ax.set_ylabel('y [m]')
-    ax.set_title(f'f/span = L/W map (black line = L/{defl_limit_denom} limit)')
-    fig.colorbar(cf, label='N (span/N = deflection, capped for display)')
-    st.pyplot(fig)
-    st.write(f"Worst-case f/span = **L/{N_worst:.0f}** (limit L/{defl_limit_denom}) -> **{status}**")
+        ax1.plot([p[0] for p in pt_loads_used], [p[1] for p in pt_loads_used],
+                  'r^', ms=10, label='charge ponctuelle')
+        ax1.legend(loc='upper right', fontsize=8)
+    ax1.set_xlabel('x [m]'); ax1.set_ylabel('y [m]')
+    ax1.set_title(f'Flèche W(x,y) [mm]  —  {load_label}')
+    ax1.set_aspect('equal')
+    fig1.colorbar(cf, label='W [mm]')
+    plt.tight_layout()
+    st.pyplot(fig1)
 
-with tabs[3]:
-    mxx_g = mxx.reshape(int(n_mesh) + 1, int(n_mesh) + 1)
-    myy_g = myy.reshape(int(n_mesh) + 1, int(n_mesh) + 1)
-    mxy_g = mxy.reshape(int(n_mesh) + 1, int(n_mesh) + 1)
-    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-    for ax, field, name in zip(axs, [mxx_g, myy_g, mxy_g], ['mxx', 'myy', 'mxy']):
+    col_a, col_b = st.columns(2)
+    with col_a:
+        Wc_list = []
+        for qi in q_sweep:
+            wi, _ = solve_plate_acm(mesh, B, nu, qi, supported,
+                                     point_loads=pt_loads_used if pt_loads_used else None)
+            Wc_list.append(wi[center_node] * 1000)
+        x_axis = np.array(q_sweep) / 1e3
+        fig2, ax2 = plt.subplots(figsize=(6, 4.5))
+        ax2.plot(x_axis, Wc_list, 'o-', color='#1f6f5c')
+        ax2.set_xlabel('Charge uniforme q [kPa]')
+        ax2.set_ylabel('Flèche au centre Wc [mm]')
+        ax2.set_title('Flèche au centre vs. charge')
+        ax2.grid(True, alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig2)
+
+    with col_b:
+        eps = 1e-9
+        N_ratio = L / np.maximum(np.abs(W / 1000.0), eps)
+        N_plot = np.clip(N_ratio, 0, 6 * DEFLECTION_LIMIT_DENOM)
+        fig3, ax3 = plt.subplots(figsize=(6.5, 5.5))
+        cf3 = ax3.contourf(X, Y, N_plot, levels=25, cmap='RdYlGn')
+        cs3 = ax3.contour(X, Y, N_ratio, levels=[DEFLECTION_LIMIT_DENOM], colors='black', linewidths=2)
+        ax3.clabel(cs3, inline=True, fontsize=8, fmt=f'L/{DEFLECTION_LIMIT_DENOM} limite')
+        ax3.plot(sx, sy, 'ko', ms=7)
+        if pt_loads_used:
+            ax3.plot([p[0] for p in pt_loads_used], [p[1] for p in pt_loads_used], 'r^', ms=10)
+        ax3.set_xlabel('x [m]'); ax3.set_ylabel('y [m]')
+        ax3.set_title(f'f/portée = L/W  (ligne noire = limite L/{DEFLECTION_LIMIT_DENOM})')
+        ax3.set_aspect('equal')
+        fig3.colorbar(cf3, label='N (portée/N = flèche)')
+        plt.tight_layout()
+        st.pyplot(fig3)
+
+# ---- TAB 2: moments & shears ------------------------------------------------
+with tabs[1]:
+    fig4, axs4 = plt.subplots(1, 3, figsize=(15, 5))
+    for ax, field, name in zip(axs4, [mxx_g, myy_g, mxy_g], ['mxx', 'myy', 'mxy']):
         cf = ax.contourf(X, Y, field / 1e3, levels=20, cmap='RdBu_r')
         ax.contour(X, Y, field / 1e3, levels=10, colors='k', linewidths=0.3, alpha=0.5)
         ax.plot(sx, sy, 'ko', ms=6)
         if pt_loads_used:
             ax.plot([p[0] for p in pt_loads_used], [p[1] for p in pt_loads_used], 'g^', ms=9)
-        ax.set_aspect('equal'); ax.set_title(f'{name} [kN.m/m]'); ax.set_xlabel('x [m]')
-        fig.colorbar(cf, ax=ax, shrink=0.8)
-    axs[0].set_ylabel('y [m]')
-    st.pyplot(fig)
-    if pt_loads_used:
-        st.info("Peak moment right under a point load is mesh-dependent (theoretically "
-                "singular in Kirchhoff theory) — refining the mesh will keep raising it. "
-                "Values away from the load converge normally.")
+        ax.set_aspect('equal'); ax.set_title(f'{name}  [kN·m/m]'); ax.set_xlabel('x [m]')
+        fig4.colorbar(cf, ax=ax, shrink=0.8)
+    axs4[0].set_ylabel('y [m]')
+    plt.tight_layout()
+    st.pyplot(fig4)
 
-with tabs[4]:
-    tx_g = tx.reshape(int(n_mesh) + 1, int(n_mesh) + 1)
-    ty_g = ty.reshape(int(n_mesh) + 1, int(n_mesh) + 1)
-    fig, axs = plt.subplots(1, 2, figsize=(11, 5))
-    for ax, field, name in zip(axs, [tx_g, ty_g], ['tx', 'ty']):
+    fig5, axs5 = plt.subplots(1, 2, figsize=(11, 5))
+    for ax, field, name in zip(axs5, [tx_g, ty_g], ['tx', 'ty']):
         cf = ax.contourf(X, Y, field / 1e3, levels=20, cmap='PuOr')
         ax.contour(X, Y, field / 1e3, levels=10, colors='k', linewidths=0.3, alpha=0.5)
         ax.plot(sx, sy, 'ko', ms=6)
         if pt_loads_used:
             ax.plot([p[0] for p in pt_loads_used], [p[1] for p in pt_loads_used], 'g^', ms=9)
-        ax.set_aspect('equal'); ax.set_title(f'{name} [kN/m]'); ax.set_xlabel('x [m]')
-        fig.colorbar(cf, ax=ax, shrink=0.8)
-    axs[0].set_ylabel('y [m]')
-    st.pyplot(fig)
+        ax.set_aspect('equal'); ax.set_title(f'{name}  [kN/m]'); ax.set_xlabel('x [m]')
+        fig5.colorbar(cf, ax=ax, shrink=0.8)
+    axs5[0].set_ylabel('y [m]')
+    plt.tight_layout()
+    st.pyplot(fig5)
 
-with tabs[5]:
-    M1_g = M1.reshape(int(n_mesh) + 1, int(n_mesh) + 1)
-    M2_g = M2.reshape(int(n_mesh) + 1, int(n_mesh) + 1)
-    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
-    for ax, field, name in zip(axs, [M1_g, M2_g], ['M1 (major)', 'M2 (minor)']):
+# ---- TAB 3: principal moments ----------------------------------------------
+with tabs[2]:
+    fig6, axs6 = plt.subplots(1, 2, figsize=(12, 5))
+    for ax, field, name in zip(axs6, [M1_g, M2_g], ['M1 (majeur)', 'M2 (mineur)']):
         cf = ax.contourf(X, Y, field / 1e3, levels=20, cmap='RdBu_r')
         ax.plot(sx, sy, 'ko', ms=6)
         if pt_loads_used:
             ax.plot([p[0] for p in pt_loads_used], [p[1] for p in pt_loads_used], 'g^', ms=9)
-        ax.set_aspect('equal'); ax.set_title(f'{name} [kN.m/m]'); ax.set_xlabel('x [m]')
-        fig.colorbar(cf, ax=ax, shrink=0.8)
-    axs[0].set_ylabel('y [m]')
-    st.pyplot(fig)
+        ax.set_aspect('equal'); ax.set_title(f'{name}  [kN·m/m]'); ax.set_xlabel('x [m]')
+        fig6.colorbar(cf, ax=ax, shrink=0.8)
+    axs6[0].set_ylabel('y [m]')
+    plt.tight_layout()
+    st.pyplot(fig6)
 
-with tabs[6]:
-    alpha_g = alpha.reshape(int(n_mesh) + 1, int(n_mesh) + 1)
-    M1_g = M1.reshape(int(n_mesh) + 1, int(n_mesh) + 1)
-    M2_g = M2.reshape(int(n_mesh) + 1, int(n_mesh) + 1)
-
-    skip = max(1, int(n_mesh) // 10)
-    Xq, Yq = X[::skip, ::skip], Y[::skip, ::skip]
-    Aq = alpha_g[::skip, ::skip]
-    M1q, M2q = M1_g[::skip, ::skip], M2_g[::skip, ::skip]
-
-    spacing = skip * (L / int(n_mesh))
     max_arrow_len = 0.90 * spacing
     min_arrow_len = 0.15 * spacing
 
@@ -387,24 +591,88 @@ with tabs[6]:
             return np.full_like(mag, max_arrow_len)
         return min_arrow_len + (mag - lo) / (hi - lo) * (max_arrow_len - min_arrow_len)
 
-    len1, len2 = stretch(np.abs(M1q)), stretch(np.abs(M2q))
+    len1 = stretch(np.abs(M1q))
+    len2 = stretch(np.abs(M2q))
     Uq1, Vq1 = np.cos(Aq) * len1, np.sin(Aq) * len1
     Uq2, Vq2 = -np.sin(Aq) * len2, np.cos(Aq) * len2
 
-    fig, ax = plt.subplots(figsize=(6.5, 5.8))
-    cf = ax.contourf(X, Y, M1_g / 1e3, levels=20, cmap='Greys', alpha=0.5)
-    for sgn in (1, -1):
-        ax.quiver(Xq, Yq, sgn * Uq1, sgn * Vq1, color='crimson', pivot='mid',
-                   angles='xy', scale_units='xy', scale=1, width=0.008,
-                   label='M1 (length ~ |M1|)' if sgn == 1 else None)
-        ax.quiver(Xq, Yq, sgn * Uq2, sgn * Vq2, color='navy', pivot='mid',
-                   angles='xy', scale_units='xy', scale=1, width=0.008,
-                   label='M2 (length ~ |M2|)' if sgn == 1 else None)
-    ax.plot(sx, sy, 'ko', ms=7)
+    fig7, ax7 = plt.subplots(figsize=(6.5, 5.8))
+    cf7 = ax7.contourf(X, Y, M1_g / 1e3, levels=20, cmap='Greys', alpha=0.5)
+    ax7.quiver(Xq, Yq, Uq1, Vq1, color='crimson', pivot='mid',
+               angles='xy', scale_units='xy', scale=1, width=0.008, label='M1 (longueur ~ |M1|)')
+    ax7.quiver(Xq, Yq, -Uq1, -Vq1, color='crimson', pivot='mid',
+               angles='xy', scale_units='xy', scale=1, width=0.008)
+    ax7.quiver(Xq, Yq, Uq2, Vq2, color='navy', pivot='mid',
+               angles='xy', scale_units='xy', scale=1, width=0.008, label='M2 (longueur ~ |M2|)')
+    ax7.quiver(Xq, Yq, -Uq2, -Vq2, color='navy', pivot='mid',
+               angles='xy', scale_units='xy', scale=1, width=0.008)
+    ax7.plot(sx, sy, 'ko', ms=7)
     if pt_loads_used:
-        ax.plot([p[0] for p in pt_loads_used], [p[1] for p in pt_loads_used], 'g^', ms=10)
-    ax.set_aspect('equal'); ax.set_xlabel('x [m]'); ax.set_ylabel('y [m]')
-    ax.set_title('Principal moment trajectories (arrow length ~ magnitude)')
-    ax.legend(loc='upper right', fontsize=8)
-    fig.colorbar(cf, ax=ax, shrink=0.8, label='M1 [kN.m/m] (background)')
-    st.pyplot(fig)
+        ax7.plot([p[0] for p in pt_loads_used], [p[1] for p in pt_loads_used], 'g^', ms=10)
+    ax7.set_aspect('equal'); ax7.set_xlabel('x [m]'); ax7.set_ylabel('y [m]')
+    ax7.set_title('Trajectoires des moments principaux (longueur ~ magnitude)')
+    ax7.legend(loc='upper right', fontsize=8)
+    fig7.colorbar(cf7, ax=ax7, shrink=0.8, label='M1 [kN·m/m] (fond)')
+    plt.tight_layout()
+    st.pyplot(fig7)
+
+# ---- TAB 4: As maps ----------------------------------------------------------
+with tabs[3]:
+    st.caption(f"d effectif = {d_eff*1000:.1f} mm — simplification As = M/(0.9·φ·fy·d), "
+               "sans facteurs de charge. Voir code pour les limites de cette approche.")
+    fig8, axs8 = plt.subplots(2, 2, figsize=(12, 10))
+    panels = [(As_CSA_xx_g, 'CSA A23.3 — As, dir. x'), (As_CSA_yy_g, 'CSA A23.3 — As, dir. y'),
+              (As_ACI_xx_g, 'ACI 318 — As, dir. x'), (As_ACI_yy_g, 'ACI 318 — As, dir. y')]
+    for ax, (field, name) in zip(axs8.ravel(), panels):
+        cf = ax.contourf(X, Y, field, levels=20, cmap='YlOrRd')
+        ax.contour(X, Y, field, levels=10, colors='k', linewidths=0.3, alpha=0.4)
+        ax.plot(sx, sy, 'ko', ms=6)
+        if pt_loads_used:
+            ax.plot([p[0] for p in pt_loads_used], [p[1] for p in pt_loads_used], 'b^', ms=9)
+        ax.set_aspect('equal'); ax.set_title(f'{name}  [mm²/m]')
+        ax.set_xlabel('x [m]'); ax.set_ylabel('y [m]')
+        fig8.colorbar(cf, ax=ax, shrink=0.8)
+    plt.tight_layout()
+    st.pyplot(fig8)
+    if pt_loads_used:
+        st.info("As sous une charge ponctuelle hérite de la singularité de moment liée au maillage — "
+                "ne pas dimensionner sur le pic brut; utiliser un moment moyenné sur la largeur de "
+                "bande de colonne ou un périmètre de poinçonnement effectif.")
+
+# ---- TAB 5: rebar layout sketches -------------------------------------------
+with tabs[4]:
+    col1, col2 = st.columns(2)
+    with col1:
+        fig9a, ax9a = plt.subplots(figsize=(6.5, 5.8))
+        norm9a = draw_principal_bars(ax9a, +1, '-')
+        base_ax(ax9a, 'Système 1 (principal M1/M2) — nappe INFÉRIEURE\n(M > 0, flexion positive)')
+        add_rho_colorbar(fig9a, ax9a, norm9a, 'Nappe inf. (trait plein)', '-')
+        plt.tight_layout()
+        st.pyplot(fig9a)
+
+        fig10a, ax10a = plt.subplots(figsize=(6.5, 5.8))
+        _, _, norm10a = draw_orthogonal_bars(ax10a, mx_bot_q, my_bot_q, '-')
+        base_ax(ax10a, 'Système 2 (orthogonal, Wood-Armer) — nappe INFÉRIEURE\nMx+=mxx+|mxy|, My+=myy+|mxy|')
+        add_rho_colorbar(fig10a, ax10a, norm10a, 'Nappe inf. (trait plein)', '-')
+        plt.tight_layout()
+        st.pyplot(fig10a)
+
+    with col2:
+        fig9b, ax9b = plt.subplots(figsize=(6.5, 5.8))
+        norm9b = draw_principal_bars(ax9b, -1, (0, (4, 2)))
+        base_ax(ax9b, 'Système 1 (principal M1/M2) — nappe SUPÉRIEURE\n(M < 0, flexion négative)')
+        add_rho_colorbar(fig9b, ax9b, norm9b, 'Nappe sup. (tirets)', (0, (4, 2)))
+        plt.tight_layout()
+        st.pyplot(fig9b)
+
+        fig10b, ax10b = plt.subplots(figsize=(6.5, 5.8))
+        _, _, norm10b = draw_orthogonal_bars(ax10b, mx_top_q, my_top_q, (0, (4, 2)))
+        base_ax(ax10b, 'Système 2 (orthogonal, Wood-Armer) — nappe SUPÉRIEURE\nMx-=|mxx-|mxy||, My-=|myy-|mxy||')
+        add_rho_colorbar(fig10b, ax10b, norm10b, 'Nappe sup. (tirets)', (0, (4, 2)))
+        plt.tight_layout()
+        st.pyplot(fig10b)
+
+    st.caption("Système 1 (principal) utilise moins d'acier total quand M1/M2 sont très différents "
+               "en magnitude, mais nécessite des barres coupées et placées selon un angle variable — "
+               "peu pratique pour la plupart des dalles coulées en place. Système 2 (orthogonal/"
+               "Wood-Armer) est ce qui est réellement construit presque toujours.")
